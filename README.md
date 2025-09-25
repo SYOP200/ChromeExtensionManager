@@ -26,3 +26,11 @@ Right-click on "Command Prompt" and select "Run as administrator."
 Install psutil using pip:
 In the Command Prompt, execute the following command:
      pip install psutil
+
+
+
+
+
+
+
+Thank you for your support on this project. We apreciate you for checking out our software, if you have any questions ask them at https://claude.ai/public/artifacts/c8ede4f2-2d0a-4285-9013-56c0f4f3e76d 
