@@ -1,0 +1,1113 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+import json
+import os
+import shutil
+import subprocess
+import platform
+import time
+import threading
+from pathlib import Path
+
+# Handle optional imports with fallbacks
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    REQUESTS_AVAILABLE = False
+
+try:
+    import websocket
+    WEBSOCKET_AVAILABLE = True
+except ImportError:
+    WEBSOCKET_AVAILABLE = False
+
+class ChromeOverride:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Chrome Override")
+        self.root.geometry("1000x800")
+        self.root.resizable(True, True)
+        
+        # Initialize all variables first
+        self.extensions = {}
+        self.chrome_running = tk.BooleanVar(value=False)
+        self.preferences_path = None
+        self.user_data_dir = None
+        self.chrome_profiles = {}
+        self.current_profile = "Default"
+        self.chrome_debug_port = 9222
+        self.chrome_connected = tk.BooleanVar(value=False)
+        self.live_extensions = {}
+        self.websocket_connection = None
+        
+        # UI components that will be created
+        self.tree = None
+        self.live_tree = None
+        self.status_bar = None
+        self.profile_combo = None
+        self.notebook = None
+        
+        # Create UI
+        try:
+            self.setup_ui()
+        except Exception as e:
+            print(f"UI Setup Error: {e}")
+            messagebox.showerror("UI Error", f"Failed to create interface: {str(e)}")
+            return
+        
+        # Initialize Chrome detection
+        try:
+            self.detect_chrome_path()
+            self.check_chrome_status()
+        except Exception as e:
+            print(f"Chrome Detection Error: {e}")
+            self.log_status(f"Chrome detection failed: {str(e)}")
+        
+    def setup_ui(self):
+        """Setup the user interface"""
+        try:
+            # Main frame
+            main_frame = ttk.Frame(self.root, padding="10")
+            main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+            
+            # Configure grid weights
+            self.root.columnconfigure(0, weight=1)
+            self.root.rowconfigure(0, weight=1)
+            main_frame.columnconfigure(0, weight=1)
+            main_frame.rowconfigure(2, weight=1)
+            
+            # Title
+            title_label = ttk.Label(main_frame, text="Chrome Override", 
+                                   font=('Arial', 16, 'bold'))
+            title_label.grid(row=0, column=0, pady=(0, 10), sticky=tk.W)
+            
+            # Status frame
+            self.create_status_frame(main_frame)
+            
+            # Extensions frame with tabs
+            self.create_extensions_frame(main_frame)
+            
+            # Buttons frame
+            self.create_buttons_frame(main_frame)
+            
+            # Status bar
+            self.create_status_bar(main_frame)
+            
+        except Exception as e:
+            raise Exception(f"UI setup failed: {str(e)}")
+    
+    def create_status_frame(self, parent):
+        """Create the status and profile selection frame"""
+        status_frame = ttk.LabelFrame(parent, text="Status & Profile Selection", padding="5")
+        status_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        status_frame.columnconfigure(1, weight=1)
+        
+        # Chrome status - Row 0
+        ttk.Label(status_frame, text="Chrome Status:").grid(row=0, column=0, sticky=tk.W)
+        
+        self.chrome_status_value = ttk.Label(status_frame, text="Checking...")
+        self.chrome_status_value.grid(row=0, column=1, sticky=tk.W, padx=(10, 0))
+        
+        ttk.Button(status_frame, text="Refresh", command=self.safe_refresh_status).grid(row=0, column=2, padx=(10, 0))
+        
+        # Connection status (if available)
+        if REQUESTS_AVAILABLE and WEBSOCKET_AVAILABLE:
+            ttk.Label(status_frame, text="Live Connection:").grid(row=0, column=3, sticky=tk.W, padx=(20, 5))
+            
+            self.connection_status_value = ttk.Label(status_frame, text="Disconnected")
+            self.connection_status_value.grid(row=0, column=4, sticky=tk.W, padx=(5, 0))
+            
+            self.connect_btn = ttk.Button(status_frame, text="Connect", command=self.safe_connect_to_chrome)
+            self.connect_btn.grid(row=0, column=5, padx=(10, 0))
+        
+        # Profile selection - Row 1
+        ttk.Label(status_frame, text="Profile:").grid(row=1, column=0, sticky=tk.W, pady=(5, 0))
+        
+        self.profile_var = tk.StringVar()
+        self.profile_combo = ttk.Combobox(status_frame, textvariable=self.profile_var, 
+                                         state="readonly", width=50)
+        self.profile_combo.grid(row=1, column=1, columnspan=2, sticky=(tk.W, tk.E), 
+                               padx=(10, 0), pady=(5, 0))
+        self.profile_combo.bind('<<ComboboxSelected>>', self.safe_on_profile_change)
+        
+        ttk.Button(status_frame, text="Scan Profiles", 
+                  command=self.safe_scan_chrome_profiles).grid(row=1, column=3, padx=(10, 0), pady=(5, 0))
+    
+    def create_extensions_frame(self, parent):
+        """Create the extensions display frame"""
+        extensions_frame = ttk.LabelFrame(parent, text="Extensions", padding="5")
+        extensions_frame.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        extensions_frame.columnconfigure(0, weight=1)
+        extensions_frame.rowconfigure(0, weight=1)
+        
+        # Create notebook for tabs
+        self.notebook = ttk.Notebook(extensions_frame)
+        self.notebook.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # File-based extensions tab
+        self.file_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.file_frame, text="📁 File Extensions")
+        self.setup_treeview(self.file_frame, "file")
+        
+        # Live extensions tab (if available)
+        if REQUESTS_AVAILABLE and WEBSOCKET_AVAILABLE:
+            self.live_frame = ttk.Frame(self.notebook)
+            self.notebook.add(self.live_frame, text="🔴 Live Extensions")
+            self.setup_treeview(self.live_frame, "live")
+        else:
+            self.live_frame = None
+            
+    def create_buttons_frame(self, parent):
+        """Create the buttons frame"""
+        buttons_frame = ttk.Frame(parent)
+        buttons_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=(10, 0))
+        
+        # Left buttons
+        left_frame = ttk.Frame(buttons_frame)
+        left_frame.pack(side=tk.LEFT)
+        
+        ttk.Button(left_frame, text="Load Extensions", 
+                  command=self.safe_load_extensions).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(left_frame, text="Toggle Selected", 
+                  command=self.safe_toggle_selected).pack(side=tk.LEFT, padx=5)
+        ttk.Button(left_frame, text="Enable All", 
+                  command=self.safe_enable_all).pack(side=tk.LEFT, padx=5)
+        ttk.Button(left_frame, text="Disable All", 
+                  command=self.safe_disable_all).pack(side=tk.LEFT, padx=5)
+        
+        # Live buttons (if available)
+        if REQUESTS_AVAILABLE and WEBSOCKET_AVAILABLE:
+            ttk.Button(left_frame, text="Live Load", 
+                      command=self.safe_load_live_extensions).pack(side=tk.LEFT, padx=5)
+            ttk.Button(left_frame, text="Live Toggle", 
+                      command=self.safe_live_toggle_selected).pack(side=tk.LEFT, padx=5)
+            ttk.Button(left_frame, text="Live Disable All", 
+                      command=self.safe_live_disable_all).pack(side=tk.LEFT, padx=5)
+        
+        # Right buttons
+        right_frame = ttk.Frame(buttons_frame)
+        right_frame.pack(side=tk.RIGHT)
+        
+        ttk.Button(right_frame, text="Backup", 
+                  command=self.safe_create_backup).pack(side=tk.LEFT, padx=(0, 5))
+        
+        if REQUESTS_AVAILABLE:
+            ttk.Button(right_frame, text="🚀 Launch Chrome", 
+                      command=self.safe_launch_chrome_debug).pack(side=tk.LEFT, padx=5)
+        
+        ttk.Button(right_frame, text="Apply Changes", 
+                  command=self.safe_apply_changes).pack(side=tk.LEFT, padx=5)
+        ttk.Button(right_frame, text="🚫 OVERRIDE 🚫", 
+                  command=self.safe_override_all_extensions).pack(side=tk.LEFT, padx=5)
+        ttk.Button(right_frame, text="💥 ALL PROFILES 💥", 
+                  command=self.safe_override_all_profiles).pack(side=tk.LEFT, padx=5)
+    
+    def create_status_bar(self, parent):
+        """Create the status bar"""
+        status_frame = ttk.Frame(parent)
+        status_frame.grid(row=4, column=0, sticky=(tk.W, tk.E), pady=(10, 0))
+        status_frame.columnconfigure(0, weight=1)
+        
+        self.status_bar = ttk.Label(status_frame, text="Ready", relief=tk.SUNKEN, anchor=tk.W)
+        self.status_bar.grid(row=0, column=0, sticky=(tk.W, tk.E))
+    
+    def setup_treeview(self, parent_frame, tree_type):
+        """Setup a treeview for extensions"""
+        try:
+            parent_frame.columnconfigure(0, weight=1)
+            parent_frame.rowconfigure(0, weight=1)
+            
+            # Create treeview
+            columns = ('Name', 'ID', 'Status', 'Version', 'Source')
+            tree = ttk.Treeview(parent_frame, columns=columns, show='tree headings', height=12)
+            
+            # Configure columns
+            tree.heading('#0', text='')
+            tree.column('#0', width=30, minwidth=30)
+            
+            column_widths = {'Name': 250, 'ID': 180, 'Status': 80, 'Version': 80, 'Source': 100}
+            for col in columns:
+                tree.heading(col, text=col)
+                tree.column(col, width=column_widths[col], minwidth=60)
+            
+            # Scrollbars
+            v_scrollbar = ttk.Scrollbar(parent_frame, orient="vertical", command=tree.yview)
+            h_scrollbar = ttk.Scrollbar(parent_frame, orient="horizontal", command=tree.xview)
+            tree.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
+            
+            # Grid layout
+            tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+            v_scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+            h_scrollbar.grid(row=1, column=0, sticky=(tk.W, tk.E))
+            
+            # Store reference
+            if tree_type == "file":
+                self.tree = tree
+            else:
+                self.live_tree = tree
+                
+        except Exception as e:
+            raise Exception(f"Failed to setup {tree_type} treeview: {str(e)}")
+    
+    def log_status(self, message):
+        """Update status bar with message"""
+        try:
+            if self.status_bar:
+                self.status_bar.config(text=str(message)[:100])  # Limit length
+                self.root.update_idletasks()
+        except Exception:
+            print(f"Status: {message}")  # Fallback to console
+    
+    def safe_wrapper(self, func, *args, **kwargs):
+        """Wrapper for safe function execution"""
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            error_msg = f"Error in {func.__name__}: {str(e)}"
+            print(error_msg)
+            self.log_status(error_msg)
+            messagebox.showerror("Error", error_msg)
+    
+    # Safe wrapper methods for all UI callbacks
+    def safe_refresh_status(self):
+        self.safe_wrapper(self.refresh_status)
+    
+    def safe_connect_to_chrome(self):
+        self.safe_wrapper(self.connect_to_chrome)
+    
+    def safe_on_profile_change(self, event):
+        self.safe_wrapper(self.on_profile_change, event)
+    
+    def safe_scan_chrome_profiles(self):
+        self.safe_wrapper(self.scan_chrome_profiles)
+    
+    def safe_load_extensions(self):
+        self.safe_wrapper(self.load_extensions)
+    
+    def safe_toggle_selected(self):
+        self.safe_wrapper(self.toggle_selected)
+    
+    def safe_enable_all(self):
+        self.safe_wrapper(self.enable_all)
+    
+    def safe_disable_all(self):
+        self.safe_wrapper(self.disable_all)
+    
+    def safe_load_live_extensions(self):
+        self.safe_wrapper(self.load_live_extensions)
+    
+    def safe_live_toggle_selected(self):
+        self.safe_wrapper(self.live_toggle_selected)
+    
+    def safe_live_disable_all(self):
+        self.safe_wrapper(self.live_disable_all)
+    
+    def safe_create_backup(self):
+        self.safe_wrapper(self.create_backup)
+    
+    def safe_launch_chrome_debug(self):
+        self.safe_wrapper(self.launch_chrome_debug)
+    
+    def safe_apply_changes(self):
+        self.safe_wrapper(self.apply_changes)
+    
+    def safe_override_all_extensions(self):
+        self.safe_wrapper(self.override_all_extensions)
+    
+    def safe_override_all_profiles(self):
+        self.safe_wrapper(self.override_all_profiles)
+    
+    # Core functionality methods
+    def detect_chrome_path(self):
+        """Detect Chrome user data path based on OS"""
+        try:
+            system = platform.system().lower()
+            
+            if system == "windows":
+                self.user_data_dir = os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\User Data")
+            elif system == "darwin":
+                self.user_data_dir = os.path.expanduser("~/Library/Application Support/Google/Chrome")
+            elif system == "linux":
+                self.user_data_dir = os.path.expanduser("~/.config/google-chrome")
+            else:
+                self.log_status("Unsupported operating system")
+                return
+                
+            if self.user_data_dir:
+                self.preferences_path = os.path.join(self.user_data_dir, "Default", "Preferences")
+                
+            if self.user_data_dir and os.path.exists(self.user_data_dir):
+                self.log_status("Chrome directory found")
+                self.scan_chrome_profiles()
+            else:
+                self.log_status("Chrome directory not found")
+                
+        except Exception as e:
+            self.log_status(f"Chrome path detection failed: {str(e)}")
+    
+    def is_chrome_running(self):
+        """Check if Chrome is currently running"""
+        if not PSUTIL_AVAILABLE:
+            return False
+            
+        try:
+            for proc in psutil.process_iter(['name']):
+                if proc.info.get('name') and 'chrome' in proc.info['name'].lower():
+                    return True
+            return False
+        except Exception:
+            return False
+    
+    def check_chrome_status(self):
+        """Update Chrome status in UI"""
+        try:
+            if not PSUTIL_AVAILABLE:
+                self.chrome_status_value.config(text="Cannot detect", foreground="orange")
+                self.chrome_running.set(False)
+                return
+                
+            if self.is_chrome_running():
+                self.chrome_status_value.config(text="Running", foreground="green")
+                self.chrome_running.set(True)
+                if REQUESTS_AVAILABLE:
+                    self.check_debug_connection()
+            else:
+                self.chrome_status_value.config(text="Not running", foreground="red")
+                self.chrome_running.set(False)
+                self.chrome_connected.set(False)
+                if REQUESTS_AVAILABLE and hasattr(self, 'connection_status_value'):
+                    self.update_connection_status()
+        except Exception as e:
+            self.log_status(f"Status check failed: {str(e)}")
+    
+    def check_debug_connection(self):
+        """Check if Chrome debug port is available"""
+        if not REQUESTS_AVAILABLE:
+            return
+            
+        try:
+            response = requests.get(f"http://localhost:{self.chrome_debug_port}/json", timeout=2)
+            self.chrome_connected.set(response.status_code == 200)
+        except:
+            self.chrome_connected.set(False)
+        
+        self.update_connection_status()
+    
+    def update_connection_status(self):
+        """Update connection status in UI"""
+        if not hasattr(self, 'connection_status_value'):
+            return
+            
+        try:
+            if self.chrome_connected.get():
+                self.connection_status_value.config(text="Connected", foreground="green")
+                self.connect_btn.config(text="Disconnect", command=self.safe_disconnect_from_chrome)
+            else:
+                self.connection_status_value.config(text="Disconnected", foreground="red")
+                self.connect_btn.config(text="Connect", command=self.safe_connect_to_chrome)
+        except Exception as e:
+            self.log_status(f"Connection status update failed: {str(e)}")
+    
+    def scan_chrome_profiles(self):
+        """Scan for Chrome profiles"""
+        if not self.user_data_dir or not os.path.exists(self.user_data_dir):
+            self.log_status("Cannot scan profiles")
+            return
+            
+        try:
+            self.chrome_profiles = {}
+            profile_names = []
+            
+            for item in os.listdir(self.user_data_dir):
+                item_path = os.path.join(self.user_data_dir, item)
+                if os.path.isdir(item_path):
+                    prefs_file = os.path.join(item_path, "Preferences")
+                    if os.path.exists(prefs_file):
+                        display_name = self.get_profile_display_name(item)
+                        
+                        self.chrome_profiles[item] = {
+                            'path': item_path,
+                            'preferences_file': prefs_file,
+                            'display_name': display_name,
+                            'folder_name': item
+                        }
+                        
+                        display_text = f"{display_name} ({item})" if display_name != item else item
+                        profile_names.append(display_text)
+            
+            if self.profile_combo:
+                self.profile_combo['values'] = profile_names
+                
+                if profile_names:
+                    # Select default profile
+                    default_profile = next((name for name in profile_names if "Default" in name), profile_names[0])
+                    self.profile_combo.set(default_profile)
+                    self.on_profile_change(None)
+                    
+            self.log_status(f"Found {len(self.chrome_profiles)} profiles")
+            
+        except Exception as e:
+            self.log_status(f"Profile scanning failed: {str(e)}")
+    
+    def get_profile_display_name(self, profile_folder):
+        """Get display name for a Chrome profile"""
+        try:
+            local_state_file = os.path.join(self.user_data_dir, "Local State")
+            if os.path.exists(local_state_file):
+                with open(local_state_file, 'r', encoding='utf-8') as f:
+                    local_state = json.load(f)
+                    
+                profile_info = local_state.get('profile', {}).get('info_cache', {}).get(profile_folder, {})
+                display_name = profile_info.get('name', profile_folder)
+                
+                if profile_info.get('user_name'):
+                    return f"{display_name} ({profile_info['user_name']})"
+                return display_name
+        except:
+            pass
+        return profile_folder
+    
+    def on_profile_change(self, event):
+        """Handle profile selection change"""
+        if not self.profile_combo:
+            return
+            
+        selected = self.profile_combo.get()
+        if not selected:
+            return
+            
+        # Extract folder name
+        folder_name = selected.split(' (')[-1].rstrip(')') if ' (' in selected else selected
+        
+        if folder_name in self.chrome_profiles:
+            self.current_profile = folder_name
+            self.preferences_path = self.chrome_profiles[folder_name]['preferences_file']
+            
+            profile_info = self.chrome_profiles[folder_name]
+            self.log_status(f"Selected: {profile_info['display_name']}")
+            
+            if not self.chrome_running.get():
+                self.load_extensions()
+    
+    def refresh_status(self):
+        """Refresh Chrome status and profiles"""
+        self.check_chrome_status()
+        self.scan_chrome_profiles()
+        if not self.chrome_running.get():
+            self.load_extensions()
+    
+    def load_extensions(self):
+        """Load extensions from Chrome preferences"""
+        if self.chrome_running.get():
+            messagebox.showwarning("Warning", "Close Chrome before loading extensions.")
+            return
+            
+        if not self.preferences_path or not os.path.exists(self.preferences_path):
+            messagebox.showerror("Error", f"Preferences file not found for '{self.current_profile}'.")
+            return
+            
+        try:
+            self.log_status("Loading extensions...")
+            
+            with open(self.preferences_path, 'r', encoding='utf-8') as f:
+                prefs = json.load(f)
+            
+            # Clear existing items
+            if self.tree:
+                for item in self.tree.get_children():
+                    self.tree.delete(item)
+            
+            self.extensions = {}
+            
+            extensions_data = prefs.get('extensions', {}).get('settings', {})
+            for ext_id, ext_data in extensions_data.items():
+                try:
+                    manifest = ext_data.get('manifest', {})
+                    name = manifest.get('name', f"Extension {ext_id[:8]}")
+                    version = manifest.get('version', "Unknown")
+                    state = ext_data.get('state', 1)
+                    status = "Enabled" if state == 1 else "Disabled"
+                    
+                    self.extensions[ext_id] = {
+                        'name': name,
+                        'version': version,
+                        'state': state,
+                        'original_state': state
+                    }
+                    
+                    if self.tree:
+                        self.tree.insert('', 'end', iid=ext_id, 
+                                       values=(name, ext_id, status, version, "File"))
+                except Exception:
+                    continue
+            
+            self.log_status(f"Loaded {len(self.extensions)} extensions")
+            
+            if len(self.extensions) == 0:
+                messagebox.showinfo("No Extensions", "No extensions found.")
+            else:
+                messagebox.showinfo("Success", f"Loaded {len(self.extensions)} extensions.")
+                
+        except json.JSONDecodeError:
+            messagebox.showerror("Error", "Chrome preferences file is corrupted.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load extensions: {str(e)}")
+    
+    def toggle_selected(self):
+        """Toggle selected extensions"""
+        if not self.tree:
+            return
+            
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showwarning("Warning", "Select an extension to toggle.")
+            return
+            
+        for item in selected:
+            if item in self.extensions:
+                current_state = self.extensions[item]['state']
+                new_state = 0 if current_state == 1 else 1
+                self.extensions[item]['state'] = new_state
+                
+                status = "Enabled" if new_state == 1 else "Disabled"
+                values = list(self.tree.item(item)['values'])
+                values[2] = status
+                self.tree.item(item, values=values)
+        
+        self.log_status(f"Toggled {len(selected)} extensions")
+    
+    def enable_all(self):
+        """Enable all extensions"""
+        if not self.tree:
+            return
+            
+        count = 0
+        for ext_id in self.extensions:
+            if self.extensions[ext_id]['state'] != 1:
+                self.extensions[ext_id]['state'] = 1
+                count += 1
+        
+        for item in self.tree.get_children():
+            values = list(self.tree.item(item)['values'])
+            values[2] = "Enabled"
+            self.tree.item(item, values=values)
+        
+        self.log_status(f"Enabled {count} extensions")
+    
+    def disable_all(self):
+        """Disable all extensions"""
+        if not self.tree:
+            return
+            
+        count = 0
+        for ext_id in self.extensions:
+            if self.extensions[ext_id]['state'] != 0:
+                self.extensions[ext_id]['state'] = 0
+                count += 1
+        
+        for item in self.tree.get_children():
+            values = list(self.tree.item(item)['values'])
+            values[2] = "Disabled"
+            self.tree.item(item, values=values)
+        
+        self.log_status(f"Disabled {count} extensions")
+    
+    def create_backup(self):
+        """Create backup of preferences file"""
+        if not self.preferences_path or not os.path.exists(self.preferences_path):
+            messagebox.showerror("Error", "Preferences file not found.")
+            return None
+            
+        try:
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            backup_path = f"{self.preferences_path}.backup_{timestamp}"
+            shutil.copy2(self.preferences_path, backup_path)
+            
+            self.log_status("Backup created")
+            messagebox.showinfo("Success", f"Backup created:\n{backup_path}")
+            return backup_path
+        except Exception as e:
+            messagebox.showerror("Error", f"Backup failed: {str(e)}")
+            return None
+    
+    def apply_changes(self):
+        """Apply changes to Chrome preferences"""
+        if self.chrome_running.get():
+            messagebox.showwarning("Warning", "Close Chrome before applying changes.")
+            return
+            
+        if not self.preferences_path or not os.path.exists(self.preferences_path):
+            messagebox.showerror("Error", "Preferences file not found.")
+            return
+        
+        # Count changes
+        changes = sum(1 for ext_data in self.extensions.values() 
+                     if ext_data['state'] != ext_data['original_state'])
+        
+        if changes == 0:
+            messagebox.showinfo("Info", "No changes to apply.")
+            return
+        
+        try:
+            self.log_status("Applying changes...")
+            
+            with open(self.preferences_path, 'r', encoding='utf-8') as f:
+                prefs = json.load(f)
+            
+            # Apply changes
+            extensions_settings = prefs.get('extensions', {}).get('settings', {})
+            for ext_id, ext_data in self.extensions.items():
+                if ext_id in extensions_settings:
+                    extensions_settings[ext_id]['state'] = ext_data['state']
+                    ext_data['original_state'] = ext_data['state']
+            
+            with open(self.preferences_path, 'w', encoding='utf-8') as f:
+                json.dump(prefs, f, indent=2)
+            
+            self.log_status(f"Applied {changes} changes")
+            messagebox.showinfo("Success", f"Applied {changes} changes!")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to apply changes: {str(e)}")
+    
+    def override_all_extensions(self):
+        """Override all extensions"""
+        if self.chrome_running.get():
+            if not messagebox.askyesno("Chrome Running", "Close Chrome and continue?"):
+                return
+            self.force_close_chrome()
+            time.sleep(2)
+        
+        if not self.preferences_path or not os.path.exists(self.preferences_path):
+            messagebox.showerror("Error", "Preferences file not found.")
+            return
+        
+        if not messagebox.askyesno("🚫 CHROME OVERRIDE 🚫", 
+                                  "⚠️ WARNING: This will disable ALL extensions! ⚠️\n\nContinue?"):
+            return
+        
+        try:
+            backup_path = self.create_backup()
+            if not backup_path:
+                return
+            
+            self.log_status("Starting override...")
+            
+            with open(self.preferences_path, 'r', encoding='utf-8') as f:
+                prefs = json.load(f)
+            
+            # Ensure structure exists
+            if 'extensions' not in prefs:
+                prefs['extensions'] = {}
+            if 'settings' not in prefs['extensions']:
+                prefs['extensions']['settings'] = {}
+            
+            extensions_settings = prefs['extensions']['settings']
+            disabled_count = len(extensions_settings)
+            
+            # Disable all extensions
+            for ext_id in extensions_settings:
+                ext_settings = extensions_settings[ext_id]
+                ext_settings['state'] = 0
+                ext_settings['disable_reasons'] = 2
+                ext_settings['was_installed_by_default'] = False
+                ext_settings['externally_uninstalled'] = True
+            
+            # Add to blacklist
+            if 'blacklist' not in prefs['extensions']:
+                prefs['extensions']['blacklist'] = []
+            
+            for ext_id in extensions_settings.keys():
+                if ext_id not in prefs['extensions']['blacklist']:
+                    prefs['extensions']['blacklist'].append(ext_id)
+            
+            # Save changes
+            with open(self.preferences_path, 'w', encoding='utf-8') as f:
+                json.dump(prefs, f, indent=2)
+            
+            self.log_status("OVERRIDE COMPLETE!")
+            
+            messagebox.showinfo("🚫 CHROME OVERRIDE COMPLETE! 🚫", 
+                              f"Disabled {disabled_count} extensions!\n\n"
+                              f"Backup: {backup_path}\n\n"
+                              "Restart Chrome to see changes.")
+            
+            self.load_extensions()
+            
+        except Exception as e:
+            messagebox.showerror("Override Failed", f"Override failed: {str(e)}")
+    
+    def override_all_profiles(self):
+        """Override extensions across all profiles"""
+        if not self.chrome_profiles:
+            messagebox.showerror("Error", "No profiles found. Scan profiles first.")
+            return
+        
+        if self.chrome_running.get():
+            if not messagebox.askyesno("Chrome Running", "Close Chrome and continue?"):
+                return
+            self.force_close_chrome()
+            time.sleep(2)
+        
+        profile_list = "\n".join([f"• {info['display_name']}" for info in self.chrome_profiles.values()])
+        
+        if not messagebox.askyesno("💥 OVERRIDE ALL PROFILES 💥", 
+                                  f"⚠️ Override {len(self.chrome_profiles)} profiles! ⚠️\n\n"
+                                  f"{profile_list}\n\nContinue?"):
+            return
+        
+        try:
+            self.log_status("Starting profile override...")
+            total_extensions = 0
+            successful = 0
+            
+            for folder, info in self.chrome_profiles.items():
+                try:
+                    prefs_path = info['preferences_file']
+                    
+                    # Backup
+                    timestamp = time.strftime("%Y%m%d_%H%M%S")
+                    backup_path = f"{prefs_path}.backup_all_{timestamp}"
+                    shutil.copy2(prefs_path, backup_path)
+                    
+                    # Override
+                    with open(prefs_path, 'r', encoding='utf-8') as f:
+                        prefs = json.load(f)
+                    
+                    extensions_settings = prefs.get('extensions', {}).get('settings', {})
+                    profile_ext_count = len(extensions_settings)
+                    total_extensions += profile_ext_count
+                    
+                    for ext_id in extensions_settings:
+                        ext_settings = extensions_settings[ext_id]
+                        ext_settings['state'] = 0
+                        ext_settings['disable_reasons'] = 2
+                        ext_settings['externally_uninstalled'] = True
+                    
+                    with open(prefs_path, 'w', encoding='utf-8') as f:
+                        json.dump(prefs, f, indent=2)
+                    
+                    successful += 1
+                    self.log_status(f"✅ {info['display_name']}: {profile_ext_count} extensions")
+                    
+                except Exception as e:
+                    self.log_status(f"❌ Failed: {info['display_name']}: {str(e)}")
+                    continue
+            
+            self.log_status("FULL PROFILE OVERRIDE COMPLETE!")
+            
+            messagebox.showinfo("💥 FULL OVERRIDE COMPLETE! 💥", 
+                              f"Successfully overridden: {successful}/{len(self.chrome_profiles)} profiles\n"
+                              f"Total extensions disabled: {total_extensions}\n\n"
+                              "Restart Chrome to see changes.")
+            
+            self.load_extensions()
+            
+        except Exception as e:
+            messagebox.showerror("Override Failed", f"Profile override failed: {str(e)}")
+    
+    def force_close_chrome(self):
+        """Force close Chrome processes"""
+        if not PSUTIL_AVAILABLE:
+            messagebox.showwarning("Warning", "Cannot force close - psutil not available")
+            return False
+        
+        try:
+            self.log_status("Closing Chrome...")
+            chrome_processes = [proc for proc in psutil.process_iter(['name']) 
+                               if proc.info.get('name') and 'chrome' in proc.info['name'].lower()]
+            
+            if not chrome_processes:
+                return True
+            
+            # Terminate processes
+            for proc in chrome_processes:
+                try:
+                    proc.terminate()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            
+            time.sleep(3)
+            
+            # Force kill if needed
+            for proc in chrome_processes:
+                try:
+                    if proc.is_running():
+                        proc.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            
+            time.sleep(1)
+            self.check_chrome_status()
+            return True
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to close Chrome: {str(e)}")
+            return False
+    
+    # Live Chrome functionality (simplified for debugging)
+    def launch_chrome_debug(self):
+        """Launch Chrome with debug mode"""
+        if not REQUESTS_AVAILABLE:
+            messagebox.showwarning("Feature Unavailable", "Requires 'requests' module.")
+            return
+        
+        if self.is_chrome_running():
+            if not messagebox.askyesno("Chrome Running", "Restart Chrome with debug mode?"):
+                return
+            self.force_close_chrome()
+            time.sleep(2)
+        
+        try:
+            chrome_exe = self.find_chrome_executable()
+            if not chrome_exe:
+                messagebox.showerror("Error", "Chrome executable not found")
+                return
+            
+            debug_args = [
+                chrome_exe,
+                f"--remote-debugging-port={self.chrome_debug_port}",
+                "--disable-extensions-except=",
+                f"--user-data-dir={self.user_data_dir}" if self.user_data_dir else ""
+            ]
+            
+            subprocess.Popen(debug_args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
+            self.log_status(f"Launching Chrome with debug port {self.chrome_debug_port}")
+            self.root.after(3000, self.check_chrome_status)
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to launch Chrome: {str(e)}")
+    
+    def find_chrome_executable(self):
+        """Find Chrome executable based on OS"""
+        system = platform.system().lower()
+        paths = []
+        
+        if system == "windows":
+            paths = [
+                r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+            ]
+        elif system == "darwin":
+            paths = ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
+        elif system == "linux":
+            paths = ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"]
+        
+        return next((path for path in paths if os.path.exists(path)), None)
+    
+    def connect_to_chrome(self):
+        """Connect to Chrome debug port"""
+        if not REQUESTS_AVAILABLE:
+            messagebox.showwarning("Feature Unavailable", "Requires 'requests' module.")
+            return
+        
+        if not self.is_chrome_running():
+            if messagebox.askyesno("Chrome Not Running", "Launch Chrome with debug mode?"):
+                self.launch_chrome_debug()
+            return
+        
+        try:
+            response = requests.get(f"http://localhost:{self.chrome_debug_port}/json", timeout=5)
+            if response.status_code != 200:
+                messagebox.showerror("Connection Error", 
+                                   f"Cannot connect to debug port {self.chrome_debug_port}")
+                return
+            
+            tabs = response.json()
+            self.chrome_connected.set(True)
+            self.update_connection_status()
+            
+            self.log_status(f"Connected! Found {len(tabs)} tabs")
+            messagebox.showinfo("Connected", f"Connected to Chrome!\nFound {len(tabs)} tabs")
+            
+        except requests.exceptions.ConnectionError:
+            messagebox.showerror("Connection Failed", 
+                               f"Could not connect to port {self.chrome_debug_port}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Connection failed: {str(e)}")
+    
+    def safe_disconnect_from_chrome(self):
+        self.safe_wrapper(self.disconnect_from_chrome)
+    
+    def disconnect_from_chrome(self):
+        """Disconnect from Chrome"""
+        self.chrome_connected.set(False)
+        if self.websocket_connection:
+            try:
+                self.websocket_connection.close()
+            except:
+                pass
+            self.websocket_connection = None
+        self.update_connection_status()
+        self.log_status("Disconnected from Chrome")
+    
+    def load_live_extensions(self):
+        """Load live extensions (simplified demo)"""
+        if not REQUESTS_AVAILABLE or not WEBSOCKET_AVAILABLE:
+            messagebox.showwarning("Feature Unavailable", 
+                                 "Live extensions require 'requests' and 'websocket-client' modules.")
+            return
+        
+        if not self.chrome_connected.get():
+            messagebox.showwarning("Not Connected", "Connect to Chrome first")
+            return
+        
+        try:
+            self.log_status("Loading live extensions...")
+            
+            # Clear live tree
+            if hasattr(self, 'live_tree') and self.live_tree:
+                for item in self.live_tree.get_children():
+                    self.live_tree.delete(item)
+            
+            # Demo live extensions (in real implementation, this would query Chrome)
+            demo_extensions = {
+                "demo1": {"name": "Live Demo Extension 1", "enabled": True, "version": "1.0"},
+                "demo2": {"name": "Live Demo Extension 2", "enabled": False, "version": "2.0"},
+                "demo3": {"name": "Live Demo Extension 3", "enabled": True, "version": "1.5"}
+            }
+            
+            self.live_extensions = demo_extensions
+            
+            for ext_id, ext_data in demo_extensions.items():
+                status = "Enabled" if ext_data['enabled'] else "Disabled"
+                if hasattr(self, 'live_tree') and self.live_tree:
+                    self.live_tree.insert('', 'end', iid=ext_id,
+                                        values=(ext_data['name'], ext_id, status, 
+                                               ext_data['version'], "Live"))
+            
+            self.log_status(f"Loaded {len(demo_extensions)} live extensions")
+            messagebox.showinfo("Live Extensions", 
+                              f"Demo: Loaded {len(demo_extensions)} live extensions\n\n"
+                              "Note: This is a demonstration of live functionality.")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load live extensions: {str(e)}")
+    
+    def live_toggle_selected(self):
+        """Toggle selected live extensions"""
+        if not hasattr(self, 'live_tree') or not self.live_tree:
+            messagebox.showwarning("Feature Unavailable", "Live extensions not available")
+            return
+        
+        if not self.chrome_connected.get():
+            messagebox.showwarning("Not Connected", "Connect to Chrome first")
+            return
+        
+        selected = self.live_tree.selection()
+        if not selected:
+            messagebox.showwarning("Warning", "Select an extension to toggle")
+            return
+        
+        # Demo toggle
+        for ext_id in selected:
+            if ext_id in self.live_extensions:
+                current = self.live_extensions[ext_id]['enabled']
+                self.live_extensions[ext_id]['enabled'] = not current
+                
+                status = "Enabled" if not current else "Disabled"
+                values = list(self.live_tree.item(ext_id)['values'])
+                values[2] = status
+                self.live_tree.item(ext_id, values=values)
+        
+        self.log_status(f"Toggled {len(selected)} live extensions (demo)")
+    
+    def live_disable_all(self):
+        """Disable all live extensions"""
+        if not hasattr(self, 'live_tree') or not self.live_tree:
+            messagebox.showwarning("Feature Unavailable", "Live extensions not available")
+            return
+        
+        if not self.chrome_connected.get():
+            messagebox.showwarning("Not Connected", "Connect to Chrome first")
+            return
+        
+        if not messagebox.askyesno("Live Disable All", 
+                                  f"Disable all {len(self.live_extensions)} live extensions?"):
+            return
+        
+        # Demo disable all
+        disabled = 0
+        for ext_id, ext_data in self.live_extensions.items():
+            if ext_data['enabled']:
+                ext_data['enabled'] = False
+                disabled += 1
+                
+                values = list(self.live_tree.item(ext_id)['values'])
+                values[2] = "Disabled"
+                self.live_tree.item(ext_id, values=values)
+        
+        self.log_status(f"Disabled {disabled} live extensions (demo)")
+        messagebox.showinfo("Live Disable Complete", f"Demo: Disabled {disabled} extensions!")
+
+def main():
+    """Main application entry point"""
+    try:
+        # Check for optional dependencies
+        missing_modules = []
+        
+        if not PSUTIL_AVAILABLE:
+            missing_modules.append("psutil")
+        if not REQUESTS_AVAILABLE:
+            missing_modules.append("requests")
+        if not WEBSOCKET_AVAILABLE:
+            missing_modules.append("websocket-client")
+        
+        if missing_modules:
+            root = tk.Tk()
+            root.withdraw()
+            
+            module_list = ", ".join(missing_modules)
+            install_cmd = f"pip install {' '.join(missing_modules)}"
+            
+            result = messagebox.askyesno("Optional Dependencies", 
+                               f"Chrome Override works better with:\n{module_list}\n\n"
+                               f"Install: {install_cmd}\n\n"
+                               "Continue with basic functionality?")
+            if not result:
+                return
+            root.destroy()
+        
+        # Launch main application
+        root = tk.Tk()
+        
+        try:
+            app = ChromeOverride(root)
+            
+            # Center window
+            root.update_idletasks()
+            width = root.winfo_width()
+            height = root.winfo_height()
+            x = (root.winfo_screenwidth() // 2) - (width // 2)
+            y = (root.winfo_screenheight() // 2) - (height // 2)
+            root.geometry(f'{width}x{height}+{x}+{y}')
+            
+            # Start main loop
+            root.mainloop()
+            
+        except Exception as e:
+            messagebox.showerror("Application Error", f"Failed to start Chrome Override: {str(e)}")
+        finally:
+            try:
+                root.destroy()
+            except:
+                pass
+    
+    except Exception as e:
+        print(f"Fatal error: {e}")
+        try:
+            import tkinter.messagebox as mb
+            mb.showerror("Fatal Error", f"Chrome Override failed to start: {str(e)}")
+        except:
+            print("Could not show error dialog")
+
+if __name__ == "__main__":
+    main()
