@@ -13,7 +13,7 @@ Requires Psutil to be installed on your operating system.
 You can download the file and open it in your files. Once opened a screen should appear with your current installed extensions. If this does not work or there is an error follow the Troubleshooting Process. 
 
 
-# Troubleshooting Process
+# TROUBLESHOOTING PROCESS 
 
 If it appears that there is a error it could be for two reasons. You may not have Psutil installed. If this is so you should see a message thats says "Error when loading Psutil" you can install Psutil by following the process below. 
 Rarely you can experience a script error. If this occurs, let us know in the Wiki page. 
